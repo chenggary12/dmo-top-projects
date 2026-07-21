@@ -111,7 +111,8 @@
   tbody td.frozen-last{border-right:2px solid var(--accent)!important}
   td.id-td{font-family:ui-monospace,monospace;font-size:12px;color:var(--muted);white-space:nowrap;padding-top:11px}
   .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
-  td.lw-td{background:var(--lw);color:var(--muted);font-size:12px;padding:8px 10px}
+  td.lw-td{background:var(--lw);color:var(--muted);font-size:12px;padding:8px 10px;cursor:pointer;max-height:38px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;vertical-align:top}
+  tr.row-expanded td.lw-td{white-space:pre-wrap;overflow:visible;max-height:none}
   tbody td.frozen.lw-td{background:var(--lw)}
   select.cell,input.cell,textarea.cell{width:100%;font:inherit;font-size:13px;color:var(--text);background:transparent;border:1px solid transparent;border-radius:5px;padding:4px 5px}
   select.cell:hover,input.cell:hover,textarea.cell:hover{border-color:var(--line2)}
@@ -1543,7 +1544,7 @@ function cellHtml(c,o){
     return`<td style="text-align:center;font-weight:600;font-size:13px;color:${col};background:${bg};padding-top:10px">${wks}</td>`;
   }
   if(c.kind==='id')return`<td class="id-td"><span class="dot" data-dot="${oid}" style="background:${DOT_COL[o.confidence]||DOT_COL['']}"></span>${esc(o.id)}</td>`;
-  if(c.kind==='lw')return`<td class="lw-td">${esc(o[c.f])||'—'}</td>`;
+  if(c.kind==='lw')return`<td class="lw-td" data-lwexpand="1">${esc(o[c.f])||'—'}</td>`;
   if(c.kind==='ai'){
     const ins=aiInsights[o.id];
     if(!ins)return`<td class="ai-td"><span class="ai-empty">—</span></td>`;
@@ -1979,7 +1980,43 @@ document.addEventListener('focusin',e=>{
     if(tr)expandRow(tr);
   }
 });
-document.addEventListener('focusout',e=>{if(e.target.matches('input.cell,textarea.cell,select.cell')){isFocused=false;}});
+// Last-week cells are read-only text (not inputs), so expansion is driven by click.
+document.addEventListener('click',e=>{
+  const lw=e.target.closest&&e.target.closest('td[data-lwexpand]');
+  if(lw){
+    const tr=lw.closest('tr');
+    if(!tr)return;
+    if(expandedRow===tr){collapseRow(tr);}        // click same lw cell again to collapse
+    else {expandRow(tr);}
+    return;
+  }
+  // clicked something that is NOT a last-week cell: if a row is expanded and the click
+  // landed outside it (and not in an editable cell that manages its own collapse), shrink it.
+  if(expandedRow){
+    const inRow=expandedRow.contains(e.target);
+    const inEditable=e.target.closest&&e.target.closest('textarea.cell,input.cell,select.cell');
+    if(!inRow&&!inEditable)collapseRow(expandedRow);
+  }
+});
+document.addEventListener('focusout',e=>{
+  if(e.target.matches('input.cell,textarea.cell,select.cell')){isFocused=false;}
+  // Collapse the expanded row once focus truly leaves it. Use the *next* focused
+  // element (relatedTarget) so we don't collapse when moving between cells in the
+  // same row. This fires no matter where the user clicks (empty space, buttons, etc.),
+  // which is why the row now reliably shrinks back.
+  if(expandedRow){
+    const next=e.relatedTarget;
+    const stayingInRow=next&&expandedRow.contains(next);
+    const movingToAnotherTextCell=next&&next.closest&&next.closest('textarea.cell');
+    if(!stayingInRow&&!movingToAnotherTextCell){
+      // defer slightly so a same-row click that refocuses doesn't cause a flicker
+      setTimeout(()=>{
+        const active=document.activeElement;
+        if(expandedRow&&!(active&&expandedRow.contains(active)))collapseRow(expandedRow);
+      },0);
+    }
+  }
+});
 
 // Expand exactly one row's note cells to full height; collapse any previously expanded row.
 function expandRow(tr){
@@ -1995,16 +2032,8 @@ function collapseRow(tr){
   tr.querySelectorAll('textarea.cell').forEach(t=>{t.style.height='';});
   if(expandedRow===tr)expandedRow=null;
 }
-// Collapse when focus leaves the expanded row entirely (click elsewhere / another row)
-document.addEventListener('focusin',e=>{
-  if(!expandedRow)return;
-  const inExpanded=expandedRow.contains(e.target);
-  const ta=e.target.closest&&e.target.closest('textarea.cell');
-  const isNote=ta&&isTextField(ta.dataset.f);
-  // if focus moved to a note cell in another row, expandRow already handled the swap;
-  // if focus moved somewhere outside the expanded row and it's not a note cell, collapse
-  if(!inExpanded&&!isNote)collapseRow(expandedRow);
-});
+// (Collapse is handled by the focusout listener above — it fires reliably no matter
+//  where the user clicks, so the row always shrinks back.)
 // As the user types, keep the expanded row's textareas sized to content
 document.addEventListener('input',e=>{
   const ta=e.target.closest&&e.target.closest('textarea.cell');
