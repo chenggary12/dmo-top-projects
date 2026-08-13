@@ -101,7 +101,9 @@
   .col-th .arr{font-size:9px;color:var(--accent)}
   .col-th .rz{position:absolute;top:0;right:0;width:7px;height:100%;cursor:col-resize;z-index:9}
   .col-th .rz:hover,.rz.on{background:var(--accent);opacity:.5}
-  .col-th.drag-over{background:#dff0ea!important;outline:2px dashed var(--accent)}
+  .col-th.drag-over{background:#dff0ea!important}
+  .col-th.drop-before{box-shadow:inset 3px 0 0 0 var(--accent)}
+  .col-th.drop-after{box-shadow:inset -3px 0 0 0 var(--accent)}
   .col-th.dragging{opacity:.4}
   tbody td{vertical-align:top;padding:6px 8px;border-bottom:1px solid var(--line)}
   tbody tr:hover td{background:#fafbfc}
@@ -425,9 +427,10 @@ const COL_DEFS={
   lwp:     {label:'Progress',   group:'Last week', kind:'lw',                     w:170},
   lwn:     {label:'Next steps', group:'Last week', kind:'lw',                     w:170},
   lwd:     {label:'Deadline',   group:'Last week', kind:'lw',                     w:140},
-  lwh:     {label:'Help needed',group:'Last week', kind:'lw',                     w:170}
+  lwh:     {label:'Help needed',group:'Last week', kind:'lw',                     w:170},
+  __actions:{label:'Actions',   group:'Actions',   kind:'act',                    w:100}
 };
-const DEFAULT_ORDER=['id','owner','project','priority','confidence','month','progress','next','deadline','help','lwp','lwn','lwd','lwh'];
+const DEFAULT_ORDER=['id','owner','project','priority','confidence','month','progress','next','deadline','help','lwp','lwn','lwd','lwh','__actions'];
 // AI insights live only in the browser session (not synced to the Sheet), keyed by opp id
 let aiInsights={};
 // persist AI insights in the browser so they survive reloads (until the next analysis overwrites them)
@@ -442,6 +445,11 @@ const S={opps:[],log:[]};
 // colOrder: array of field keys (may be reordered/hidden)
 let colOrder=[...DEFAULT_ORDER];
 let hiddenCols=new Set();
+// Columns the user has deliberately drag-positioned. These are exempt from group
+// snapping so they stay exactly where dropped (e.g. moved to the far-right end).
+let freeCols=new Set();
+function loadFreeCols(){try{const r=lsGet('dmo_freecols');if(r&&r.value){const a=JSON.parse(r.value);if(Array.isArray(a))freeCols=new Set(a);}}catch(e){}}
+function saveFreeCols(){lsSet('dmo_freecols',JSON.stringify([...freeCols]));}
 let freezeIdx=-1;
 const W={};DEFAULT_ORDER.forEach(f=>W[f]=COL_DEFS[f].w);
 const F={q:'',owner:[],priority:[],confidence:[],status:[]};
@@ -638,12 +646,18 @@ function applySharedColumnMeta(){
       });
     }
     const order=window.__sharedOrder;
+    const tomb=loadDeletedCols();
     if(Array.isArray(order)&&order.length){
-      // keep only known fields, then append any local-only fields (e.g. ai_insight) at the end
-      const known=order.filter(f=>COL_DEFS[f]);
-      colOrder.forEach(f=>{if(!known.includes(f)&&COL_DEFS[f])known.push(f);});
+      // keep only known, non-deleted fields, then append any local-only fields at the end
+      const known=order.filter(f=>COL_DEFS[f]&&!tomb.has(f));
+      colOrder.forEach(f=>{if(!known.includes(f)&&COL_DEFS[f]&&!tomb.has(f))known.push(f);});
       if(known.length)colOrder=known;
     }
+    // also drop any tombstoned columns that slipped into COL_DEFS/colOrder
+    tomb.forEach(f=>{
+      if(COL_DEFS[f])delete COL_DEFS[f];
+      const i=colOrder.indexOf(f);if(i>=0)colOrder.splice(i,1);
+    });
   }catch(e){}
 }
 function applyTitles(t){
@@ -663,11 +677,11 @@ function $i(id){return document.getElementById(id);}
 // visible columns in current order
 // Keep columns grouped contiguously (Details → This week → Last week) so the
 // group-header row never gets a stray/split segment. Preserves order within each group.
-const GROUP_SEQ=['Details','This week','Last week','AI'];
+const GROUP_SEQ=['Details','This week','Last week','AI','Actions'];
 function normalizeColOrder(){
   const known=colOrder.filter(f=>COL_DEFS[f]);
   // Columns that are exempt from group-snapping — they stay exactly where the user drags them.
-  const FREE=['ai_insight'];
+  const FREE=[...new Set(['ai_insight','__actions',...freeCols])]; // dedupe: a dragged free col is also in freeCols
   // remember each free column's index so we can re-insert it after sorting the rest
   const freePos=FREE.filter(f=>known.includes(f)).map(f=>({f,i:known.indexOf(f)}));
   const rest=known.filter(f=>!FREE.includes(f));
@@ -741,8 +755,10 @@ function adoptSheetColumns(sheetData){
     const known=new Set(Object.keys(COL_DEFS));
     const custom=loadCustomColsRaw(); // {field:{label,type}}
     let added=false;
+    const tomb=loadDeletedCols();
     Object.keys(seen).forEach(f=>{
       if(IGNORE[f]||known.has(f)||COL_DEFS[f])return;
+      if(tomb.has(f))return; // never re-adopt a column the user deleted
       // register a new custom column definition
       const isColN=/^column_\d+$/.test(f);
       COL_DEFS[f]={label:(isColN?'Column '+f.split('_')[1]:f),group:'Details',
@@ -762,6 +778,19 @@ function adoptSheetColumns(sheetData){
     }
   }catch(e){}
 }
+// ── deleted-column tombstones ──
+// When a column is deleted we record its key here so it is never re-adopted from
+// lingering Sheet data or a stale shared column order (which caused deleted columns
+// to reappear as the first columns on refresh).
+function loadDeletedCols(){
+  try{const r=lsGet('dmo_deletedcols');if(r&&r.value){const a=JSON.parse(r.value);if(Array.isArray(a))return new Set(a);}}catch(e){}
+  return new Set();
+}
+function addDeletedCol(field){
+  const s=loadDeletedCols();s.add(field);
+  lsSet('dmo_deletedcols',JSON.stringify([...s]));
+}
+function isDeletedCol(field){return loadDeletedCols().has(field);}
 // raw read of the custom-columns store as an object (safe default {})
 function loadCustomColsRaw(){
   try{const r=lsGet('dmo_customcols');if(r&&r.value){const o=JSON.parse(r.value);if(o&&typeof o==='object')return o;}}catch(e){}
@@ -778,6 +807,7 @@ async function loadData(){
       syncSafe=true;                          // we have a confirmed good Sheet load → saving is safe
       window.__sheetColsPayload=sheetData; // stash for column reconciliation after order loads
       S.log=(Array.isArray(sheetData.log)?sheetData.log:[]).map(normalizeLog);
+      if(Array.isArray(sheetData.editlog))actIngest(sheetData.editlog);
       if(sheetData.options&&Object.keys(sheetData.options).length)applyOptions(sheetData.options);
       if(sheetData.ftypes&&Object.keys(sheetData.ftypes).length)applyFtypes(sheetData.ftypes);
       lsSet('dmo_opps',JSON.stringify(S.opps));
@@ -817,6 +847,7 @@ async function loadData(){
       }
     }
     if(rch&&rch.value){const h=JSON.parse(rch.value);if(Array.isArray(h))hiddenCols=new Set(h);}
+    loadFreeCols(); // restore which columns the user has explicitly drag-positioned
     if(rgb&&rgb.value)groupBy=rgb.value;
     if(window.__sheetColsPayload){adoptSheetColumns(window.__sheetColsPayload);window.__sheetColsPayload=null;}
     applySharedColumnMeta(); // shared column titles + order from the Sheet (all devices match)
@@ -852,10 +883,13 @@ function saveViewState(){
   lsSet('dmo_view',JSON.stringify({F,sortF,sortD,sortStack,groupBy}));
 }
 function loadViewState(){
+  // Always start clean: never restore filters or search on load, so a stale filter
+  // can never hide every row and leave the page looking empty. Sort/grouping (which
+  // don't hide rows) are still remembered; saved views still work when clicked.
+  Object.keys(F).forEach(k=>{F[k]=Array.isArray(F[k])?[]:'';});
   const r=lsGet('dmo_view');if(!r||!r.value)return;
   try{
     const v=JSON.parse(r.value);
-    if(v.F)Object.assign(F,v.F);
     if(Array.isArray(v.sortStack)&&v.sortStack.length){sortStack=v.sortStack.filter(s=>s&&s.f);}
     else if(v.sortF){sortStack=[{f:v.sortF,d:v.sortD||'asc'}];}
     else sortStack=[];
@@ -933,16 +967,18 @@ function applyFreezeStyles(){
     if(gi===0){
       // dots header — always frozen, always at left:0
       th.classList.add('frozen');th.classList.remove('frozen-last');
+      th.style.left='0px';
       return;
     }
     const span=+(th.getAttribute('colspan')||1);
     const frozen=ci<=freezeIdx;
     th.classList.toggle('frozen',frozen);th.classList.remove('frozen-last');
     if(frozen){
-      th.style.left='';
+      // sticky left = dots width + offset of this group's first visual column
+      th.style.left=(DOTS+(offs[ci]||0))+'px';
       const last=ci+span-1;
       if(last>=freezeIdx&&ci<=freezeIdx)th.classList.add('frozen-last');
-    }
+    } else { th.style.left=''; }
     ci+=span;
   });
 
@@ -951,6 +987,7 @@ function applyFreezeStyles(){
   colThs.forEach((th,i)=>{
     if(i===0){
       th.classList.add('frozen');th.classList.remove('frozen-last');
+      th.style.left='0px';
       return;
     }
     const vi=i-1; // visual col index
@@ -958,7 +995,7 @@ function applyFreezeStyles(){
     const frozen=vi<=freezeIdx;
     th.classList.toggle('frozen',frozen);
     th.classList.toggle('frozen-last',frozen&&vi===freezeIdx);
-    th.style.left='';
+    th.style.left=frozen?(DOTS+(offs[vi]||0))+'px':'';
   });
 
   // ── body rows ──
@@ -969,6 +1006,7 @@ function applyFreezeStyles(){
       if(i===0){
         // dots td — always frozen at left:0
         td.classList.add('frozen');td.classList.remove('frozen-last');
+        td.style.left='0px';
         return;
       }
       const vi=i-1;
@@ -976,7 +1014,7 @@ function applyFreezeStyles(){
       const frozen=vi<=freezeIdx;
       td.classList.toggle('frozen',frozen);
       td.classList.toggle('frozen-last',frozen&&vi===freezeIdx);
-      td.style.left='';
+      td.style.left=frozen?(DOTS+(offs[vi]||0))+'px':'';
     });
   });
   pinFrozen(); // JS-driven pin (works even if CSS position:sticky is ignored)
@@ -994,23 +1032,18 @@ function ensurePinListener(){
   _pinListenerAttached=true;
 }
 function pinFrozen(){
+  // CSS position:sticky (with border-collapse:separate) already pins frozen columns
+  // and the group-header row correctly. We must NOT also translateX by scrollLeft —
+  // doing both double-compensates and makes frozen columns drift right while the rest
+  // slides left. Here we only manage z-index layering and clear any stale transforms.
   const sc=document.getElementById('tbl-scroll');
   if(!sc)return;
-  const x=sc.scrollLeft;
-  // every frozen cell (headers + body) gets translated by +scrollLeft to stay put;
-  // a raised z-index + opaque bg (from CSS) keeps them above scrolling columns.
   const cells=sc.querySelectorAll('td.frozen, th.frozen');
-  if(freezeIdx<0){
-    // unfrozen: clear any transforms
-    cells.forEach(el=>{el.style.transform='';});
-    sc.querySelectorAll('[data-pinned]').forEach(el=>{el.style.transform='';el.removeAttribute('data-pinned');});
-    return;
-  }
   cells.forEach(el=>{
-    el.style.transform='translateX('+x+'px)';
-    el.style.zIndex=el.tagName==='TH'?'40':'20'; // frozen headers above header row; frozen body above scrolling cells
-    el.setAttribute('data-pinned','1');
+    if(el.style.transform)el.style.transform='';
+    el.style.zIndex=el.tagName==='TH'?'40':'20';
   });
+  sc.querySelectorAll('[data-pinned]').forEach(el=>{el.style.transform='';el.removeAttribute('data-pinned');});
 }
 
 /* ── column drag-drop ── */
@@ -1020,15 +1053,34 @@ function startColDrag(e,f){
   dragSrc=f;
   setTimeout(()=>{const th=e.target.closest('.col-th');if(th)th.classList.add('dragging');},0);
 }
-function onColDragOver(e,f){e.preventDefault();e.dataTransfer.dropEffect='move';const th=e.target.closest('.col-th');if(th&&f!==dragSrc)th.classList.add('drag-over');}
-function onColDragLeave(e){const th=e.target.closest('.col-th');if(th)th.classList.remove('drag-over');}
+function onColDragOver(e,f){
+  e.preventDefault();e.dataTransfer.dropEffect='move';
+  const th=e.target.closest('.col-th');
+  if(!th||f===dragSrc)return;
+  document.querySelectorAll('.col-th').forEach(t=>t.classList.remove('drag-over','drop-before','drop-after'));
+  th.classList.add('drag-over');
+  // right half of the header => drop AFTER this column (lets you land at the far-right end)
+  const r=th.getBoundingClientRect();
+  const after=(e.clientX-r.left)>r.width/2;
+  th.classList.add(after?'drop-after':'drop-before');
+  th.dataset.dropAfter=after?'1':'';
+}
+function onColDragLeave(e){const th=e.target.closest('.col-th');if(th)th.classList.remove('drag-over','drop-before','drop-after');}
 function onColDrop(e,targetF){
   e.preventDefault();
   document.querySelectorAll('.col-th').forEach(t=>t.classList.remove('drag-over','dragging'));
   if(!dragSrc||dragSrc===targetF){dragSrc=null;return;}
-  const si=colOrder.indexOf(dragSrc),ti=colOrder.indexOf(targetF);
+  const th=e.target.closest('.col-th');
+  const after=th&&th.dataset.dropAfter==='1';
+  document.querySelectorAll('.col-th').forEach(t=>{t.classList.remove('drop-before','drop-after');t.dataset.dropAfter='';});
+  const si=colOrder.indexOf(dragSrc);
+  let ti=colOrder.indexOf(targetF);
   if(si<0||ti<0){dragSrc=null;return;}
-  colOrder.splice(si,1);colOrder.splice(ti,0,dragSrc);
+  colOrder.splice(si,1);                      // remove dragged col first
+  ti=colOrder.indexOf(targetF);               // recompute target index after removal
+  const insertAt=after?ti+1:ti;               // right half => after the target
+  colOrder.splice(insertAt,0,dragSrc);
+  freeCols.add(dragSrc);saveFreeCols();   // remember the user's explicit position; don't group-snap it back
   dragSrc=null;
   saveOrder();rebuildTable();renderRows();
   // app order is master → push the new column order to the Sheet so it mirrors the app
@@ -1037,7 +1089,7 @@ function onColDrop(e,targetF){
 }
 function onColDragEnd(){
   dragSrc=null;
-  document.querySelectorAll('.col-th').forEach(t=>t.classList.remove('drag-over','dragging'));
+  document.querySelectorAll('.col-th').forEach(t=>{t.classList.remove('drag-over','dragging','drop-before','drop-after');t.dataset.dropAfter='';});
 }
 
 /* ── filters ── */
@@ -1147,7 +1199,7 @@ function renderFilterMenu(k){
 /* ── table build / rebuild ── */
 function buildColgroup(){
   const vc=visCols();
-  return'<colgroup><col style="width:28px">'+vc.map(c=>`<col data-c="${c.f}" style="width:${(W[c.f]||(COL_DEFS[c.f]&&COL_DEFS[c.f].w)||140)}px">`).join('')+`<col style="width:${ACT_W}px"></colgroup>`;
+  return'<colgroup><col style="width:28px">'+vc.map(c=>`<col data-c="${c.f}" style="width:${(W[c.f]||(COL_DEFS[c.f]&&COL_DEFS[c.f].w)||140)}px">`).join('')+'</colgroup>';
 }
 function buildGroupRow(){
   const vc=visCols();
@@ -1158,6 +1210,7 @@ function buildGroupRow(){
   function grpLabel(g){
     if(g==='Details'){const n=visible().length;return '<span id="rec-count" style="font-weight:600;color:var(--muted)">'+n+' record'+(n===1?'':'s')+'</span>';}
     if(g==='AI')return '';
+    if(g==='Actions')return '';
     return g==='Last week'?'Last week · auto':g==='This week'?'This week · w/c '+wkLabel:g;
   }
   function grpCls(g){return g==='This week'?' tw':g==='Last week'?' lw':'';}
@@ -1196,12 +1249,13 @@ function buildGroupRow(){
     const borderRight=isFrozenLast?'border-right:2px solid var(--accent);':'';
     html+=`<th class="grp-th${grpCls(seg.g)}${seg.frozen?' frozen':''}${isFrozenLast?' frozen-last':''}" colspan="${seg.n}" style="${stickyStyle}${borderRight}">${seg.isSplitFree?'':grpLabel(seg.g)}</th>`;
   });
-  html+='<th class="grp-th"></th></tr>';
+  html+='</tr>';
   return html;
 }
 function buildColRow(){
   const vc=visCols();
   return'<tr><th class="dots-th"><input type="checkbox" id="chk-all" title="Select all"></th>'+vc.map((c,i)=>{
+    if(c.f==='__actions')return`<th class="col-th" data-f="__actions" data-vi="${i}" draggable="true"><div class="col-th-inner"><span class="lbl" style="cursor:default">Actions</span></div></th>`;
     return`<th class="col-th" data-f="${c.f}" data-vi="${i}" draggable="true">
       <div class="col-th-inner">
         <span class="lbl" data-sf="${c.f}">${esc(c.label)}<span class="arr" data-ar="${c.f}"></span></span>
@@ -1209,7 +1263,7 @@ function buildColRow(){
       </div>
       <span class="rz" data-rz="${c.f}"></span>
     </th>`;
-  }).join('')+'<th class="col-th"><span class="lbl" style="cursor:default">Actions</span></th></tr>';
+  }).join('')+'</tr>';
 }
 function rebuildTable(){
   const t=$i('main-tbl');
@@ -1488,9 +1542,10 @@ function onCellChange(e){
     const v=el.value;if(!v)return;
     const cur=(o[f]||'').split(',').map(s=>s.trim()).filter(Boolean);
     if(!cur.includes(v))cur.push(v);
-    o[f]=cur.join(', ');
+    var _mo=o[f];o[f]=cur.join(', ');logCell(o,f,_mo,o[f]);
     pushUndo();saveOpps();renderRows();return;
   }
+  logCell(o,f,o[f],el.value);
   o[f]=el.value;
   if(f==='status'){o.stage_updated_on=new Date().toISOString().slice(0,10);}
   if(el.dataset.tint)applyTint(el);
@@ -1535,6 +1590,7 @@ function toDateInput(v){
 }
 function cellHtml(c,o){
   const oid=esc(o.id);
+  if(c.kind==='act')return`<td class="act-td"><button class="rbtn" data-act="hist" data-oid="${oid}">History</button><button class="rbtn rbtn-del" data-act="del" data-oid="${oid}" title="Delete this row">🗑</button></td>`;
   // ── special non-editable kinds ──
   if(c.kind==='wks'){
     const ref=o.stage_updated_on||o.created_on||null;
@@ -1544,7 +1600,12 @@ function cellHtml(c,o){
     return`<td style="text-align:center;font-weight:600;font-size:13px;color:${col};background:${bg};padding-top:10px">${wks}</td>`;
   }
   if(c.kind==='id')return`<td class="id-td"><span class="dot" data-dot="${oid}" style="background:${DOT_COL[o.confidence]||DOT_COL['']}"></span>${esc(o.id)}</td>`;
-  if(c.kind==='lw')return`<td class="lw-td" data-lwexpand="1">${esc(o[c.f])||'—'}</td>`;
+  if(c.kind==='lw'){
+    // date-type last-week fields (e.g. lwd = last-week Deadline) should show date only, not a timestamp
+    const isDateLw=(c.f==='lwd')||FTYPES[c.f]==='date';
+    const raw=isDateLw?toDateInput(o[c.f]):o[c.f];
+    return`<td class="lw-td" data-lwexpand="1">${esc(raw)||'—'}</td>`;
+  }
   if(c.kind==='ai'){
     const ins=aiInsights[o.id];
     if(!ins)return`<td class="ai-td"><span class="ai-empty">—</span></td>`;
@@ -1617,8 +1678,7 @@ function rowHtml(o,vc){
   const sel=selectedIds.has(o.id);
   return `<tr class="${sel?'row-selected':''}" data-rowid="${esc(o.id)}">`+
     `<td class="dots-td"><input type="checkbox" class="row-chk" data-chk="${esc(o.id)}"${sel?' checked':''}></td>`+
-    vc.map(c=>cellHtml(c,o)).join('')+
-    `<td class="act-td"><button class="rbtn" data-act="hist" data-oid="${esc(o.id)}">History</button><button class="rbtn rbtn-del" data-act="del" data-oid="${esc(o.id)}" title="Delete this row">🗑</button></td></tr>`;
+    vc.map(c=>cellHtml(c,o)).join('')+'</tr>';
 }
 
 function updateRecCount(){const el=$i('rec-count');if(el){const n=visible().length;el.textContent=n+' record'+(n===1?'':'s');}}
@@ -1722,6 +1782,7 @@ function bulkDelete(){
   const n=selectedIds.size;if(!n)return;
   showConfirm('Delete '+n+' opportunit'+(n===1?'y':'ies'),'This removes the selected rows. History entries stay in the log.',()=>{
     pushUndo();
+    S.opps.filter(o=>selectedIds.has(o.id)).forEach(o=>logRow(o,'delete_row'));
     S.opps=S.opps.filter(o=>!selectedIds.has(o.id));
     selectedIds.clear();
     allowShrinkOnce=true; // explicit user deletion — permitted to reduce row count
@@ -1845,11 +1906,12 @@ function addOpp(){
   const today=new Date().toISOString().slice(0,10);
   // add new opportunity at the TOP of the list, flagged so it stays pinned above any active sort
   S.opps.unshift({id:nextId(),owner:'',account:'',partner_type:'',project:'',priority:'',confidence:'',status:'',month:'',year:'',progress:'',next:'',help:'',lwp:'',lwn:'',lwh:'',created_on:today,stage_updated_on:today,_isNew:true});
+  logRow(S.opps[0],'add_row');
   saveOpps();renderRows();
 }
 function doDelete(id){
   const o=S.opps.find(x=>x.id===id);if(!o)return;
-  showConfirm('Delete opportunity','Delete '+id+(o.account?' ('+o.account+')':'')+'? History entries stay in the log.',()=>{pushUndo();S.opps=S.opps.filter(x=>x.id!==id);allowShrinkOnce=true;saveOpps();renderRows();});
+  showConfirm('Delete opportunity','Delete '+id+(o.account?' ('+o.account+')':'')+'? History entries stay in the log.',()=>{logRow(o,'delete_row');pushUndo();S.opps=S.opps.filter(x=>x.id!==id);allowShrinkOnce=true;saveOpps();renderRows();});
 }
 function weekCommencing(){const d=new Date();const dow=d.getDay();const diff=(dow===0?6:dow-1);d.setDate(d.getDate()-diff);return d.toISOString().slice(0,10);}
 // Weekly roll now runs automatically server-side (Apps Script, every Monday 00:00 HK).
@@ -1860,7 +1922,7 @@ function chipsHtml(o){return`<span class="chip">Owner · ${esc(o.owner)||'—'}<
 function histRowsHtml(id){
   const rows=S.log.filter(l=>l.oid===id).sort((a,b)=>b.wk.localeCompare(a.wk));
   if(!rows.length)return'<tr><td colspan="4" style="padding:22px;text-align:center;color:var(--muted)">No history yet — entries appear after each weekly roll.</td></tr>';
-  return rows.map(l=>`<tr><td class="wk">${esc(l.wk)}</td><td>${esc(l.p)||'—'}</td><td>${esc(l.n)||'—'}</td><td>${esc(l.h)||'—'}</td></tr>`).join('');
+  return rows.map(l=>`<tr><td class="wk" style="white-space:nowrap;vertical-align:top">${esc(toDateInput(l.wk)||l.wk)}</td><td>${esc(l.p)||'—'}</td><td>${esc(l.n)||'—'}</td><td>${esc(l.h)||'—'}</td></tr>`).join('');
 }
 function refreshHistTab(){
   const id=$i('hist-sel').value;const o=S.opps.find(x=>x.id===id);
@@ -1926,6 +1988,7 @@ async function pollSheet(){
     if(!r.ok)throw new Error('JSONP failed');
     const data=r._data;
     if(!data||!Array.isArray(data.opps))throw new Error('bad response');
+    if(Array.isArray(data.editlog))actIngest(data.editlog);
     const hash=String(simpleHash(JSON.stringify(data.opps)));
     if(hash!==lastHash){
       lastHash=hash;
@@ -1973,10 +2036,12 @@ function stopPolling(){if(pollTimer){clearInterval(pollTimer);pollTimer=null;}}
 // pause polling while user is typing
 document.addEventListener('focusin',e=>{
   if(e.target.matches('input.cell,textarea.cell,select.cell'))isFocused=true;
-  // expand the row when a note cell (Progress/Next/Help) is focused — one at a time
-  const ta=e.target.closest('textarea.cell');
-  if(ta&&isTextField(ta.dataset.f)){
-    const tr=ta.closest('tr');
+  // expand the row when ANY editable cell is focused — one at a time.
+  // Keying off the generic .cell classes means every column (including custom
+  // columns added in future) gets the auto-expand behavior automatically.
+  const cell=e.target.closest('input.cell,select.cell,textarea.cell,select.multi-add');
+  if(cell){
+    const tr=cell.closest('tr');
     if(tr)expandRow(tr);
   }
 });
@@ -1988,6 +2053,16 @@ document.addEventListener('click',e=>{
     if(!tr)return;
     if(expandedRow===tr){collapseRow(tr);}        // click same lw cell again to collapse
     else {expandRow(tr);}
+    return;
+  }
+  // clicking any non-editable data cell (e.g. id) also expands its row, so the
+  // expand behavior is uniform across every column. Editable cells expand via focusin.
+  const plainTd=e.target.closest&&e.target.closest('#main-tbl tbody td');
+  const plainTr=plainTd&&plainTd.closest('tr[data-rowid]');
+  const onControl=e.target.closest&&e.target.closest('button,a,input[type=checkbox],.actions,.rowmenu,.hist-btn');
+  const onEditable=e.target.closest&&e.target.closest('input.cell,select.cell,textarea.cell');
+  if(plainTd&&plainTr&&!onControl&&!onEditable){
+    expandRow(plainTr);
     return;
   }
   // clicked something that is NOT a last-week cell: if a row is expanded and the click
@@ -2199,6 +2274,7 @@ function openAddColumn(afterField){
   lsSet('dmo_ftypes',JSON.stringify(FTYPES));
   saveOrder();saveCustomCols();
   const titles={};Object.keys(COL_DEFS).forEach(k=>{titles[k]=COL_DEFS[k].label;});lsSet('dmo_titles',JSON.stringify(titles));
+  logCol(field,label,'add_column');
   saveOpps(); // one call: adds the column to the Sheet + writes data
   rebuildTable();renderRows();
   // visible confirmation + bring the new column into view
@@ -2223,8 +2299,10 @@ function deleteColumn(field){
     hiddenCols.delete(field);
     // strip the value off every opp
     S.opps.forEach(o=>{if(field in o)delete o[field];});
+    // remember this deletion so the column is never re-adopted from lingering Sheet data
+    addDeletedCol(field);
     // persist: tell the Sheet to drop the column, save meta/order/data
-    sheetDeleteColumn(field);
+    logCol(field,label,'delete_column');sheetDeleteColumn(field);
     saveCustomCols();saveFieldMeta();saveOrder();saveHidden();saveOpps();
     rebuildTable();renderRows();renderHiddenControl();
     toast('Deleted "'+label+'" column.');
@@ -2382,6 +2460,128 @@ document.addEventListener('keydown',e=>{
 });
 document.addEventListener('click',e=>{if(!e.target.closest('#ctx-menu'))closeCtx();});
 
+/* ═══ Pick-your-name identity + Edit_log audit trail ═══════════════════
+   Login gate (attribution, not security), captures committed changes,
+   Activity panel. Added as a self-contained module. */
+const DMO_TEAM=['Miharu','Ami','Mei','Fu Wei','Gloria','Candy','Vera','Sam','TT','Yin Yin','Min Min','Gary'];
+let ACT_LOG=[];        // full activity log (server + local)
+let _actSeen={};       // dedupe by log_id
+let _editQueue=[];     // pending entries to POST
+let _editTimer=null;
+
+function currentUser(){try{const v=localStorage.getItem('dmo_user');if(v)return v;}catch(e){}return (typeof MEM==='object'&&MEM.dmo_user)||'';}
+function setUser(n){n=String(n||'').trim();if(!n)return;try{localStorage.setItem('dmo_user',n);}catch(e){}if(typeof MEM==='object')MEM.dmo_user=n;renderUserChip();}
+
+function actIngest(arr){
+  if(!Array.isArray(arr))return;
+  arr.forEach(e=>{const id=e&&e.log_id;if(!id)return;if(_actSeen[id])return;_actSeen[id]=1;ACT_LOG.push(e);});
+  const m=$i('act-modal');if(m&&!m.classList.contains('hidden'))renderActivity();
+}
+function _pushEdit(entry){
+  entry.log_id=entry.log_id||('E'+Date.now()+'-'+Math.random().toString(36).slice(2,7));
+  entry.timestamp=entry.timestamp||new Date().toISOString();
+  entry.user=entry.user||currentUser()||'Unknown';
+  _actSeen[entry.log_id]=1;ACT_LOG.push(entry);_editQueue.push(entry);
+  clearTimeout(_editTimer);_editTimer=setTimeout(flushEditLog,1200);
+  const m=$i('act-modal');if(m&&!m.classList.contains('hidden'))renderActivity();
+}
+function flushEditLog(){
+  if(!_editQueue.length)return;
+  const entries=_editQueue.splice(0,_editQueue.length);
+  try{sheetPost({action:'append_editlog_batch',entries});}catch(e){}
+}
+function _lbl(f){return (typeof COL_DEFS==='object'&&COL_DEFS[f]&&COL_DEFS[f].label)||f;}
+function logCell(o,f,oldV,newV){
+  if(String(oldV==null?'':oldV)===String(newV==null?'':newV))return;
+  _pushEdit({opp_id:(o&&o.id)||'',account:(o&&o.account)||'',project:(o&&o.project)||'',field:_lbl(f),action:'edit',old_value:oldV==null?'':String(oldV),new_value:newV==null?'':String(newV)});
+}
+function logRow(o,action){
+  _pushEdit({opp_id:(o&&o.id)||'',account:(o&&o.account)||'',project:(o&&o.project)||'',field:'',action:action,old_value:'',new_value:''});
+}
+function logCol(field,label,action){
+  _pushEdit({opp_id:'',account:'',project:'',field:label||field,action:action,old_value:'',new_value:''});
+}
+
+/* ── UI injection ── */
+function _injectAuditUI(){
+  const bar=document.querySelector('.topnav-r');
+  if(bar&&!$i('act-open')){
+    const actBtn=document.createElement('button');
+    actBtn.id='act-open';actBtn.className='btn ghost-w';actBtn.textContent='Activity';
+    actBtn.addEventListener('click',openActivity);
+    const undo=$i('hd-undo');
+    if(undo){bar.insertBefore(actBtn,undo);}else{bar.appendChild(actBtn);}
+  }
+  /* login gate disabled on this tool — Activity log still records edits */
+  if(!$i('act-modal')){
+    const m=document.createElement('div');m.id='act-modal';m.className='hidden';
+    m.style.cssText='position:fixed;inset:0;z-index:4000;background:rgba(17,20,26,.5);display:flex;align-items:center;justify-content:center';
+    m.innerHTML='<div style="background:#fff;border-radius:14px;width:min(880px,94vw);max-height:86vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.3)">'
+      +'<div style="display:flex;align-items:center;gap:10px;padding:15px 20px;border-bottom:1px solid #eef0f3;flex-wrap:wrap">'
+      +'<div style="font-size:16px;font-weight:700;color:#1f2430;flex:1">Activity log</div>'
+      +'<select id="act-fuser" style="padding:6px 8px;border:1px solid #d5d9e0;border-radius:8px;font-size:12px"></select>'
+      +'<input id="act-fq" placeholder="Filter by opportunity…" style="padding:6px 9px;border:1px solid #d5d9e0;border-radius:8px;font-size:12px;width:190px">'
+      +'<button id="act-close" style="border:0;background:#eef0f3;border-radius:8px;padding:6px 13px;cursor:pointer;font-size:13px">Close</button>'
+      +'</div><div id="act-body" style="overflow:auto;padding:2px 0"></div></div>';
+    document.body.appendChild(m);
+    m.addEventListener('click',e=>{if(e.target===m)closeActivity();});
+    $i('act-close').addEventListener('click',closeActivity);
+    $i('act-fuser').addEventListener('change',renderActivity);
+    $i('act-fq').addEventListener('input',renderActivity);
+  }
+  renderUserChip();renderLoginGrid();
+}
+function renderUserChip(){const c=$i('user-chip');if(!c)return;const u=currentUser()||'Set name';c.innerHTML='<span style="width:7px;height:7px;border-radius:50%;background:#22c55e;display:inline-block"></span>'+esc(u)+' <span style="opacity:.7">▾</span>';}
+function renderLoginGrid(){
+  const g=$i('login-grid');if(!g)return;const cur=currentUser();
+  g.innerHTML=DMO_TEAM.map(n=>'<button class="login-name" data-n="'+esc(n)+'" style="padding:10px 6px;border:1px solid '+(n===cur?'#2563eb':'#d5d9e0')+';background:'+(n===cur?'#eff4ff':'#fff')+';border-radius:9px;font-size:13px;cursor:pointer;font-weight:'+(n===cur?'600':'500')+'">'+esc(n)+'</button>').join('');
+  g.querySelectorAll('.login-name').forEach(b=>b.addEventListener('click',()=>{setUser(b.dataset.n);hideLogin();}));
+}
+function showLogin(){renderLoginGrid();const ov=$i('login-ov');if(ov)ov.style.display='flex';}
+function hideLogin(){const ov=$i('login-ov');if(ov)ov.style.display='none';renderUserChip();}
+
+function openActivity(){
+  const m=$i('act-modal');if(!m)return;
+  const sel=$i('act-fuser');
+  if(sel){const users=Array.from(new Set(ACT_LOG.map(e=>e.user).filter(Boolean))).sort();const cur=sel.value;sel.innerHTML='<option value="">All people</option>'+users.map(u=>'<option value="'+esc(u)+'">'+esc(u)+'</option>').join('');sel.value=cur;}
+  m.classList.remove('hidden');renderActivity();
+}
+function closeActivity(){const m=$i('act-modal');if(m)m.classList.add('hidden');}
+function _fmtTs(t){if(!t)return'';const d=new Date(t);if(isNaN(d.getTime()))return String(t);return d.toLocaleString([],{year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});}
+function _trim(v){v=v==null?'':String(v);return v.length>70?v.slice(0,70)+'…':v;}
+function _actDesc(e){
+  const f=esc(e.field||'');
+  if(e.action==='add_row')return 'added a new opportunity';
+  if(e.action==='delete_row')return 'deleted an opportunity';
+  if(e.action==='add_column')return 'added column <b>'+f+'</b>';
+  if(e.action==='delete_column')return 'deleted column <b>'+f+'</b>';
+  const ov=esc(_trim(e.old_value)),nv=esc(_trim(e.new_value));
+  return 'changed <b>'+f+'</b> from “'+(ov||'—')+'” to “'+(nv||'—')+'”';
+}
+function renderActivity(){
+  const body=$i('act-body');if(!body)return;
+  const fu=($i('act-fuser')&&$i('act-fuser').value)||'';
+  const fq=(($i('act-fq')&&$i('act-fq').value)||'').toLowerCase();
+  let rows=ACT_LOG.slice();
+  rows.sort((a,b)=>String(b.timestamp||'').localeCompare(String(a.timestamp||'')));
+  rows=rows.filter(e=>{
+    if(fu&&e.user!==fu)return false;
+    if(fq){const hay=((e.opp_id||'')+' '+(e.account||'')+' '+(e.project||'')).toLowerCase();if(hay.indexOf(fq)===-1)return false;}
+    return true;
+  });
+  if(!rows.length){body.innerHTML='<div style="padding:32px;text-align:center;color:#9aa1ac;font-size:13px">No activity yet.</div>';return;}
+  body.innerHTML=rows.map(e=>{
+    const who=esc(e.user||'Unknown');const what=_actDesc(e);
+    const ctx=[e.opp_id,e.account,e.project].filter(Boolean).map(esc).join(' · ');
+    return '<div style="padding:10px 20px;border-bottom:1px solid #f2f3f5">'
+      +'<div style="font-size:13px;color:#1f2430;line-height:1.45"><b>'+who+'</b> '+what+'</div>'
+      +(ctx?'<div style="font-size:11px;color:#8a909b;margin-top:2px">'+ctx+'</div>':'')
+      +'<div style="font-size:11px;color:#b3b8c0;margin-top:2px">'+esc(_fmtTs(e.timestamp))+'</div></div>';
+  }).join('');
+}
+
+/* boot the audit UI immediately (DOM is present; this script is at end of body) */
+_injectAuditUI();
 /* ── init ── */
 (async()=>{
   await loadData();
